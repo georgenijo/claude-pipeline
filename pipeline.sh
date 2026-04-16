@@ -86,7 +86,7 @@ if ! should_skip_step "$LOG_FILE" "context-gatherer"; then
 
   CONTEXT_FILE="$LOGS_DIR/context.md"
 
-  run_agent "context-gatherer" "haiku" \
+  run_agent "context-gatherer" "sonnet" \
     "Gather context for this issue in the project at $PROJECT_DIR.
 
 Issue:

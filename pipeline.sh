@@ -58,7 +58,7 @@ run_agent() {
   echo ""
   echo "--- [$agent_name] (model=$model, iter=$iteration) ---"
 
-  log_agent_start "$agent_name" "$iteration"
+  log_agent_start "$agent_name" "$iteration" "$model"
 
   local start_time=$SECONDS
   local exit_code=0
@@ -86,15 +86,19 @@ if ! should_skip_step "$LOG_FILE" "context-gatherer"; then
 
   CONTEXT_FILE="$LOGS_DIR/context.md"
 
+  MODELS_FILE="$LOGS_DIR/models.json"
+
   run_agent "context-gatherer" "sonnet" \
     "Gather context for this issue in the project at $PROJECT_DIR.
 
 Issue:
 $ISSUE_BODY
 
-Write your context document to: $CONTEXT_FILE"
+Write your context document to: $CONTEXT_FILE
+Write your model assignments to: $MODELS_FILE"
 
-  log_step_artifact "context-gatherer" "$CONTEXT_FILE"
+  log_step_artifact "$CONTEXT_FILE"
+  log_step_artifact "$MODELS_FILE"
 
   if [ ! -f "$CONTEXT_FILE" ]; then
     log_error "Context gatherer did not produce context.md"
@@ -104,6 +108,33 @@ Write your context document to: $CONTEXT_FILE"
 else
   echo "Skipping context-gatherer (already completed)"
   CONTEXT_FILE="$LOGS_DIR/context.md"
+fi
+
+# --- Load Model Assignments ---
+MODELS_FILE="$LOGS_DIR/models.json"
+
+# Defaults
+MODEL_ARCHITECT="opus"
+MODEL_REVIEWER="opus"
+MODEL_BUILDER="sonnet"
+MODEL_TESTER="sonnet"
+MODEL_FIXER="sonnet"
+
+if [ -f "$MODELS_FILE" ]; then
+  MODEL_ARCHITECT=$(jq -r '.assignments.architect // "opus"' "$MODELS_FILE")
+  MODEL_REVIEWER=$(jq -r '.assignments["senior-reviewer"] // "opus"' "$MODELS_FILE")
+  MODEL_BUILDER=$(jq -r '.assignments.builder // "sonnet"' "$MODELS_FILE")
+  MODEL_TESTER=$(jq -r '.assignments.tester // "sonnet"' "$MODELS_FILE")
+  MODEL_FIXER=$(jq -r '.assignments.fixer // "sonnet"' "$MODELS_FILE")
+  COMPLEXITY=$(jq -r '.complexity // "unknown"' "$MODELS_FILE")
+
+  log_model_assignments "$MODELS_FILE"
+
+  echo ""
+  echo "Model assignments (complexity=$COMPLEXITY):"
+  echo "  architect=$MODEL_ARCHITECT reviewer=$MODEL_REVIEWER builder=$MODEL_BUILDER tester=$MODEL_TESTER fixer=$MODEL_FIXER"
+else
+  echo "No models.json — using defaults (opus/sonnet)"
 fi
 
 # --- Step 2 & 3: Architect + Review Loop ---
@@ -134,7 +165,7 @@ $(cat "$PREV_REVIEW")"
 
     # Architect
     PLAN_FILE="$LOGS_DIR/plan-v${PLAN_VERSION}.md"
-    run_agent "architect" "opus" \
+    run_agent "architect" "$MODEL_ARCHITECT" \
       "Create an implementation plan for this issue.
 
 $CONTEXT_CONTENT
@@ -142,7 +173,7 @@ $FEEDBACK
 
 Write your plan to: $PLAN_FILE" "$REVIEW_ROUND"
 
-    log_step_artifact "architect" "$PLAN_FILE"
+    log_step_artifact "$PLAN_FILE"
 
     if [ ! -f "$PLAN_FILE" ]; then
       log_error "Architect did not produce plan"
@@ -154,7 +185,7 @@ Write your plan to: $PLAN_FILE" "$REVIEW_ROUND"
     REVIEW_FILE="$LOGS_DIR/review-${REVIEW_ROUND}.md"
     PLAN_CONTENT="$(cat "$PLAN_FILE")"
 
-    run_agent "senior-reviewer" "opus" \
+    run_agent "senior-reviewer" "$MODEL_REVIEWER" \
       "Review this implementation plan.
 
 ## Context
@@ -165,7 +196,7 @@ $PLAN_CONTENT
 
 Write your review to: $REVIEW_FILE" "$REVIEW_ROUND"
 
-    log_step_artifact "senior-reviewer" "$REVIEW_FILE"
+    log_step_artifact "$REVIEW_FILE"
 
     if [ ! -f "$REVIEW_FILE" ]; then
       log_error "Reviewer did not produce review"
@@ -176,6 +207,7 @@ Write your review to: $REVIEW_FILE" "$REVIEW_ROUND"
     # Check if approved
     if grep -qi "^# Review: APPROVED" "$REVIEW_FILE"; then
       APPROVED=true
+      log_review_result "$REVIEW_ROUND" true
       echo "    ✓ Plan APPROVED (round $REVIEW_ROUND)"
 
       # Mark architect-approved as completed step
@@ -183,6 +215,7 @@ Write your review to: $REVIEW_FILE" "$REVIEW_ROUND"
       jq '.completed_steps += ["architect-approved"]' "$LOG_FILE" > "$tmp" && mv "$tmp" "$LOG_FILE"
     else
       echo "    ✗ Plan NEEDS REVISION (round $REVIEW_ROUND/$MAX_REVIEW_ROUNDS)"
+      log_review_result "$REVIEW_ROUND" false
       PLAN_VERSION=$((PLAN_VERSION + 1))
     fi
   done
@@ -210,7 +243,7 @@ if ! should_skip_step "$LOG_FILE" "builder"; then
   BRANCH_NAME="issue-${ISSUE_NUM}-$(echo "$ISSUE_BODY" | head -1 | sed 's/[^a-zA-Z0-9]/-/g' | tr '[:upper:]' '[:lower:]' | cut -c1-40)"
   git -C "$PROJECT_DIR" checkout -b "$BRANCH_NAME" 2>/dev/null || git -C "$PROJECT_DIR" checkout "$BRANCH_NAME"
 
-  run_agent "builder" "sonnet" \
+  run_agent "builder" "$MODEL_BUILDER" \
     "Implement the following approved plan in the project at $PROJECT_DIR.
 You are on branch $BRANCH_NAME.
 
@@ -222,7 +255,7 @@ $PLAN_CONTENT
 
 Implement all changes. Commit when done."
 
-  log_step_artifact "builder" "branch:$BRANCH_NAME"
+  log_step_artifact "branch:$BRANCH_NAME"
 
   # Update log with branch
   tmp=$(mktemp)
@@ -249,7 +282,7 @@ if ! should_skip_step "$LOG_FILE" "tests-pass"; then
     # Test
     TEST_RESULTS="$LOGS_DIR/test-results-${FIX_ROUND}.json"
 
-    run_agent "tester" "sonnet" \
+    run_agent "tester" "$MODEL_TESTER" \
       "Test the changes on branch $BRANCH_NAME in $PROJECT_DIR.
 
 ## Plan (what was built)
@@ -257,18 +290,20 @@ $PLAN_CONTENT
 
 Write test results to: $TEST_RESULTS" "$FIX_ROUND"
 
-    log_step_artifact "tester" "$TEST_RESULTS"
+    log_step_artifact "$TEST_RESULTS"
 
     if [ ! -f "$TEST_RESULTS" ]; then
       echo "    ⚠ No test results file — assuming needs fixing"
     elif jq -e '.status == "PASS"' "$TEST_RESULTS" >/dev/null 2>&1; then
       TESTS_PASS=true
+      log_test_result "$FIX_ROUND" true
       echo "    ✓ Tests PASS (round $FIX_ROUND)"
 
       tmp=$(mktemp)
       jq '.completed_steps += ["tests-pass"]' "$LOG_FILE" > "$tmp" && mv "$tmp" "$LOG_FILE"
       continue
     else
+      log_test_result "$FIX_ROUND" false
       echo "    ✗ Tests FAIL (round $FIX_ROUND/$MAX_FIX_ROUNDS)"
     fi
 
@@ -276,7 +311,7 @@ Write test results to: $TEST_RESULTS" "$FIX_ROUND"
     if [ "$TESTS_PASS" = false ] && [ "$FIX_ROUND" -lt "$MAX_FIX_ROUNDS" ]; then
       TEST_CONTENT="$(cat "$TEST_RESULTS" 2>/dev/null || echo 'No test results file')"
 
-      run_agent "fixer" "sonnet" \
+      run_agent "fixer" "$MODEL_FIXER" \
         "Fix the failing tests in $PROJECT_DIR on branch $BRANCH_NAME.
 
 ## Test Results
@@ -287,7 +322,7 @@ $PLAN_CONTENT
 
 Fix the bugs and commit." "$FIX_ROUND"
 
-      log_step_artifact "fixer" "fix-round-$FIX_ROUND"
+      log_step_artifact "fix-round-$FIX_ROUND"
     fi
   done
 fi
@@ -327,8 +362,8 @@ PREOF
   # Extract PR number and merge
   PR_NUM=$(echo "$PR_URL" | grep -oP '\d+$' || echo "")
   if [ -n "$PR_NUM" ]; then
-    log_pr "$PR_NUM" "$BRANCH_NAME"
-    gh pr merge "$PR_NUM" --repo "$REPO_SLUG" --squash --admin --delete-branch 2>/dev/null || echo "Merge failed — PR left open"
+    log_pr "$PR_NUM" "$PR_URL" "$BRANCH_NAME"
+    gh pr merge "$PR_NUM" --repo "$REPO_SLUG" --squash --admin --delete-branch 2>/dev/null && log_merged || echo "Merge failed — PR left open"
   fi
 
   log_pipeline_end "completed"

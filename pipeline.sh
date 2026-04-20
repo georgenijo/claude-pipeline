@@ -3,12 +3,13 @@ set -euo pipefail
 
 # ============================================================
 # Claude Agent Pipeline
-# Usage: pipeline.sh <issue-number> [--project-dir /path/to/repo]
+# Usage: pipeline.sh <issue-number> [--project-dir /path/to/repo] [--dry-run]
 # ============================================================
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/lib/logging.sh"
 source "$SCRIPT_DIR/lib/recovery.sh"
+source "$SCRIPT_DIR/lib/pr-monitor.sh"
 
 # --- Config ---
 MAX_REVIEW_ROUNDS=3
@@ -21,9 +22,11 @@ ISSUE_NUM="${1:?Usage: pipeline.sh <issue-number> [--project-dir /path]}"
 shift
 
 PROJECT_DIR="$(pwd)"
+DRY_RUN=false
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --project-dir) PROJECT_DIR="$2"; shift 2 ;;
+    --dry-run) DRY_RUN=true; shift ;;
     *) echo "Unknown arg: $1"; exit 1 ;;
   esac
 done
@@ -63,15 +66,22 @@ run_agent() {
   local start_time=$SECONDS
   local exit_code=0
 
-  $CLAUDE_BIN -p "$prompt" \
-    --dangerously-skip-permissions \
-    --model "$model" \
-    --system-prompt-file "$AGENTS_DIR/$agent_name.md" \
-    --add-dir "$PROJECT_DIR" \
-    2>"$LOGS_DIR/${agent_name}-${iteration}-stderr.log" \
-    || exit_code=$?
+  if [ "$DRY_RUN" = true ]; then
+    echo "    [DRY RUN] Would run: $CLAUDE_BIN -p <prompt> --model $model --system-prompt-file $AGENTS_DIR/$agent_name.md --add-dir $PROJECT_DIR"
+    echo "    [DRY RUN] Prompt length: ${#prompt} chars"
+    local duration=0
+  else
+    $CLAUDE_BIN -p "$prompt" \
+      --dangerously-skip-permissions \
+      --model "$model" \
+      --system-prompt-file "$AGENTS_DIR/$agent_name.md" \
+      --add-dir "$PROJECT_DIR" \
+      2>"$LOGS_DIR/${agent_name}-${iteration}-stderr.log" \
+      || exit_code=$?
 
-  local duration=$(( SECONDS - start_time ))
+    local duration=$(( SECONDS - start_time ))
+  fi
+
   echo "    Duration: ${duration}s, exit: $exit_code"
 
   log_agent_end "$agent_name" "$exit_code"
@@ -100,7 +110,9 @@ Write your model assignments to: $MODELS_FILE"
   log_step_artifact "$CONTEXT_FILE"
   log_step_artifact "$MODELS_FILE"
 
-  if [ ! -f "$CONTEXT_FILE" ]; then
+  if [ "$DRY_RUN" = true ] && [ ! -f "$CONTEXT_FILE" ]; then
+    echo "[DRY RUN] Stub context" > "$CONTEXT_FILE"
+  elif [ ! -f "$CONTEXT_FILE" ]; then
     log_error "Context gatherer did not produce context.md"
     echo "ERROR: context.md not created"
     exit 1
@@ -175,7 +187,9 @@ Write your plan to: $PLAN_FILE" "$REVIEW_ROUND"
 
     log_step_artifact "$PLAN_FILE"
 
-    if [ ! -f "$PLAN_FILE" ]; then
+    if [ "$DRY_RUN" = true ] && [ ! -f "$PLAN_FILE" ]; then
+      echo "[DRY RUN] Stub plan" > "$PLAN_FILE"
+    elif [ ! -f "$PLAN_FILE" ]; then
       log_error "Architect did not produce plan"
       echo "ERROR: Plan not created"
       exit 1
@@ -198,7 +212,10 @@ Write your review to: $REVIEW_FILE" "$REVIEW_ROUND"
 
     log_step_artifact "$REVIEW_FILE"
 
-    if [ ! -f "$REVIEW_FILE" ]; then
+    if [ "$DRY_RUN" = true ] && [ ! -f "$REVIEW_FILE" ]; then
+      echo "# Review: APPROVED" > "$REVIEW_FILE"
+      echo "    [DRY RUN] Auto-approving plan"
+    elif [ ! -f "$REVIEW_FILE" ]; then
       log_error "Reviewer did not produce review"
       echo "ERROR: Review not created"
       exit 1
@@ -241,7 +258,11 @@ if ! should_skip_step "$LOG_FILE" "builder"; then
 
   # Create branch
   BRANCH_NAME="issue-${ISSUE_NUM}-$(echo "$ISSUE_BODY" | head -1 | sed 's/[^a-zA-Z0-9]/-/g' | tr '[:upper:]' '[:lower:]' | cut -c1-40)"
-  git -C "$PROJECT_DIR" checkout -b "$BRANCH_NAME" 2>/dev/null || git -C "$PROJECT_DIR" checkout "$BRANCH_NAME"
+  if [ "$DRY_RUN" = true ]; then
+    echo "    [DRY RUN] Would create/checkout branch: $BRANCH_NAME"
+  else
+    git -C "$PROJECT_DIR" checkout -b "$BRANCH_NAME" 2>/dev/null || git -C "$PROJECT_DIR" checkout "$BRANCH_NAME"
+  fi
 
   run_agent "builder" "$MODEL_BUILDER" \
     "Implement the following approved plan in the project at $PROJECT_DIR.
@@ -292,6 +313,11 @@ Write test results to: $TEST_RESULTS" "$FIX_ROUND"
 
     log_step_artifact "$TEST_RESULTS"
 
+    if [ "$DRY_RUN" = true ] && [ ! -f "$TEST_RESULTS" ]; then
+      echo '{"status":"PASS"}' > "$TEST_RESULTS"
+      echo "    [DRY RUN] Auto-passing tests"
+    fi
+
     if [ ! -f "$TEST_RESULTS" ]; then
       echo "    ⚠ No test results file — assuming needs fixing"
     elif jq -e '.status == "PASS"' "$TEST_RESULTS" >/dev/null 2>&1; then
@@ -327,24 +353,41 @@ Fix the bugs and commit." "$FIX_ROUND"
   done
 fi
 
-# --- Step 7: PR + Merge ---
+# --- Step 7: PR Creation ---
 echo ""
-echo "========== STEP 7: PR + Merge =========="
+echo "========== STEP 7: PR Creation =========="
 
 REPO_SLUG=$(git -C "$PROJECT_DIR" remote get-url origin | sed 's|.*github.com[:/]||;s|\.git$||')
 
-# Push branch
-git -C "$PROJECT_DIR" push -u origin "$BRANCH_NAME" 2>/dev/null || true
+if [ "$DRY_RUN" = true ]; then
+  # --- Dry run: print what would happen ---
+  ISSUE_TITLE=$(gh issue view "$ISSUE_NUM" --repo "$REPO_SLUG" --json title -q '.title' 2>/dev/null || echo "Issue $ISSUE_NUM")
+  echo "    [DRY RUN] Would push branch: $BRANCH_NAME"
+  echo "    [DRY RUN] Would create PR: \"feat: $ISSUE_TITLE\" closing #$ISSUE_NUM"
+  echo ""
+  echo "========== STEP 8: PR Monitor (CI + CodeRabbit) =========="
+  echo "    [DRY RUN] Would poll CI checks (timeout: 600s, interval: ${PR_POLL_INTERVAL}s)"
+  echo "    [DRY RUN] Would wait for CodeRabbit review (settle: ${CR_SETTLE_TIME}s)"
+  echo "    [DRY RUN] If issues found → run pr-fixer agent (model: sonnet) → push → loop"
+  echo "    [DRY RUN] Max monitor rounds: $MAX_PR_ROUNDS"
+  echo "    [DRY RUN] On clean: squash merge with --admin --delete-branch"
+  echo "    [DRY RUN] On max rounds: leave PR open for manual review"
+  log_pipeline_end "dry_run"
+  echo ""
+  echo "=== Pipeline DRY RUN COMPLETE: $PROJECT_NAME #$ISSUE_NUM ==="
+else
+  # Push branch
+  git -C "$PROJECT_DIR" push -u origin "$BRANCH_NAME" 2>/dev/null || true
 
-# Create PR
-ISSUE_TITLE=$(gh issue view "$ISSUE_NUM" --repo "$REPO_SLUG" --json title -q '.title' 2>/dev/null || echo "Issue $ISSUE_NUM")
+  # Create PR
+  ISSUE_TITLE=$(gh issue view "$ISSUE_NUM" --repo "$REPO_SLUG" --json title -q '.title' 2>/dev/null || echo "Issue $ISSUE_NUM")
 
-if [ "$TESTS_PASS" = true ]; then
-  PR_URL=$(gh pr create \
-    --repo "$REPO_SLUG" \
-    --head "$BRANCH_NAME" \
-    --title "feat: $ISSUE_TITLE" \
-    --body "$(cat <<PREOF
+  if [ "$TESTS_PASS" = true ]; then
+    PR_URL=$(gh pr create \
+      --repo "$REPO_SLUG" \
+      --head "$BRANCH_NAME" \
+      --title "feat: $ISSUE_TITLE" \
+      --body "$(cat <<PREOF
 Closes #$ISSUE_NUM
 
 ## Pipeline Run
@@ -357,25 +400,37 @@ Logs: \`pipeline-logs/$PROJECT_NAME/issue-$ISSUE_NUM/\`
 PREOF
 )" 2>/dev/null || echo "PR creation failed")
 
-  echo "PR: $PR_URL"
+    echo "PR: $PR_URL"
 
-  # Extract PR number and merge
-  PR_NUM=$(echo "$PR_URL" | grep -oP '\d+$' || echo "")
-  if [ -n "$PR_NUM" ]; then
-    log_pr "$PR_NUM" "$PR_URL" "$BRANCH_NAME"
-    gh pr merge "$PR_NUM" --repo "$REPO_SLUG" --squash --admin --delete-branch 2>/dev/null && log_merged || echo "Merge failed — PR left open"
-  fi
+    # Extract PR number
+    PR_NUM=$(echo "$PR_URL" | grep -oE '[0-9]+$' || echo "")
+    if [ -n "$PR_NUM" ]; then
+      log_pr "$PR_NUM" "$PR_URL" "$BRANCH_NAME"
 
-  log_pipeline_end "completed"
-  echo ""
-  echo "=== Pipeline COMPLETE: $PROJECT_NAME #$ISSUE_NUM ==="
-else
-  # Tests didn't pass — create draft PR
-  PR_URL=$(gh pr create \
-    --repo "$REPO_SLUG" \
-    --head "$BRANCH_NAME" \
-    --title "draft: $ISSUE_TITLE" \
-    --body "$(cat <<PREOF
+      # --- Step 8: PR Monitor — wait for CI + CodeRabbit, fix, repeat ---
+      echo ""
+      echo "========== STEP 8: PR Monitor (CI + CodeRabbit) =========="
+
+      if pr_monitor_loop "$REPO_SLUG" "$PR_NUM" "$BRANCH_NAME" "$PROJECT_DIR" "$PLAN_FILE" "$LOG_FILE"; then
+        echo "    PR is clean — merging"
+        gh pr merge "$PR_NUM" --repo "$REPO_SLUG" --squash --admin --delete-branch 2>/dev/null && log_merged || echo "Merge failed — PR left open"
+        log_pipeline_end "completed"
+        echo ""
+        echo "=== Pipeline COMPLETE: $PROJECT_NAME #$ISSUE_NUM ==="
+      else
+        echo "    PR still has issues after $MAX_PR_ROUNDS monitor rounds — leaving open for manual review"
+        log_pipeline_end "needs_review"
+        echo ""
+        echo "=== Pipeline NEEDS REVIEW: $PROJECT_NAME #$ISSUE_NUM ==="
+      fi
+    fi
+  else
+    # Tests didn't pass — create draft PR
+    PR_URL=$(gh pr create \
+      --repo "$REPO_SLUG" \
+      --head "$BRANCH_NAME" \
+      --title "draft: $ISSUE_TITLE" \
+      --body "$(cat <<PREOF
 Related: #$ISSUE_NUM
 
 ## Pipeline Run — NEEDS MANUAL REVIEW
@@ -388,11 +443,14 @@ Logs: \`pipeline-logs/$PROJECT_NAME/issue-$ISSUE_NUM/\`
 PREOF
 )" --draft 2>/dev/null || echo "PR creation failed")
 
-  echo "Draft PR: $PR_URL"
-  log_pipeline_end "needs_review"
-  echo ""
-  echo "=== Pipeline NEEDS REVIEW: $PROJECT_NAME #$ISSUE_NUM ==="
+    echo "Draft PR: $PR_URL"
+    log_pipeline_end "needs_review"
+    echo ""
+    echo "=== Pipeline NEEDS REVIEW: $PROJECT_NAME #$ISSUE_NUM ==="
+  fi
 fi
 
 # Return to main
-git -C "$PROJECT_DIR" checkout main 2>/dev/null || true
+if [ "$DRY_RUN" != true ]; then
+  git -C "$PROJECT_DIR" checkout main 2>/dev/null || true
+fi
